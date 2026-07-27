@@ -1546,53 +1546,79 @@ test_fm_send_exits_nonzero_on_unproven_submit() {
   pass "fm-send exits non-zero unless delivery is proven empty"
 }
 
-# --- herdr backend-awareness (fm-turnend-guard-h6-adjacent transport fix) ----
+# --- herdr/orca backend-awareness (fm-turnend-guard-h6-adjacent transport fix,
+# fm-orca-supervisor-m4) ------------------------------------------------------
 # Discovery, busy/pending dispatch, and the full inject_msg guard chain must
-# work through the herdr backend, not just tmux. Env-var prefix assignments
-# (e.g. `TMUX_PANE= HERDR_ENV=1 ... discover_supervisor_target`) neutralize
-# whatever ambient TMUX_PANE/HERDR_ENV the CURRENT dev/CI shell happens to carry
-# for the duration of that one call only, so these tests are deterministic
-# regardless of what runtime backend is running this test suite itself.
+# work through the herdr and orca backends, not just tmux. Env-var prefix
+# assignments (e.g. `TMUX_PANE= HERDR_ENV=1 ORCA_PANE_KEY= ...
+# discover_supervisor_target`) neutralize whatever ambient TMUX_PANE/HERDR_ENV/
+# ORCA_PANE_KEY the CURRENT dev/CI shell happens to carry for the duration of
+# that one call only, so these tests are deterministic regardless of what
+# runtime backend is running this test suite itself - notably, a shell running
+# inside an Orca-managed terminal always has $ORCA_PANE_KEY set ambiently.
 
 test_discover_supervisor_backend_precedence() {
   local out
-  out=$(FM_SUPERVISOR_BACKEND=herdr TMUX_PANE='%9' HERDR_ENV=1 HERDR_PANE_ID=w1:p1 discover_supervisor_backend)
+  out=$(FM_SUPERVISOR_BACKEND=herdr TMUX_PANE='%9' HERDR_ENV=1 HERDR_PANE_ID=w1:p1 ORCA_PANE_KEY='' discover_supervisor_backend)
   [ "$out" = herdr ] || fail "explicit FM_SUPERVISOR_BACKEND override was not honored: $out"
 
-  out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='%9' HERDR_ENV=1 HERDR_PANE_ID=w1:p1 discover_supervisor_backend)
+  out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='%9' HERDR_ENV=1 HERDR_PANE_ID=w1:p1 ORCA_PANE_KEY='' discover_supervisor_backend)
   [ "$out" = tmux ] || fail "TMUX_PANE should win over HERDR_ENV (tmux nested in herdr resolves to tmux): $out"
 
-  out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p1 discover_supervisor_backend)
+  out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p1 ORCA_PANE_KEY='' discover_supervisor_backend)
   [ "$out" = herdr ] || fail "HERDR_ENV=1 with HERDR_PANE_ID present should resolve to herdr: $out"
 
-  if out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='' HERDR_ENV='' HERDR_PANE_ID='' discover_supervisor_backend); then
-    fail "bare fallback (no override, no TMUX_PANE, no HERDR_ENV) should return non-zero"
+  out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='' HERDR_ENV='' HERDR_PANE_ID='' ORCA_PANE_KEY='tab1:leaf1' discover_supervisor_backend)
+  [ "$out" = orca ] || fail "ORCA_PANE_KEY set (with no tmux/herdr markers) should resolve to orca: $out"
+
+  out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='%9' HERDR_ENV='' HERDR_PANE_ID='' ORCA_PANE_KEY='tab1:leaf1' discover_supervisor_backend)
+  [ "$out" = tmux ] || fail "TMUX_PANE should win over ORCA_PANE_KEY: $out"
+
+  out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p1 ORCA_PANE_KEY='tab1:leaf1' discover_supervisor_backend)
+  [ "$out" = herdr ] || fail "HERDR_ENV+HERDR_PANE_ID should win over ORCA_PANE_KEY: $out"
+
+  if out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='' HERDR_ENV='' HERDR_PANE_ID='' ORCA_PANE_KEY='' discover_supervisor_backend); then
+    fail "bare fallback (no override, no TMUX_PANE, no HERDR_ENV, no ORCA_PANE_KEY) should return non-zero"
   fi
   [ "$out" = tmux ] || fail "bare fallback should still print tmux: $out"
 
-  pass "discover_supervisor_backend: override > TMUX_PANE > HERDR_ENV+HERDR_PANE_ID > tmux fallback"
+  pass "discover_supervisor_backend: override > TMUX_PANE > HERDR_ENV+HERDR_PANE_ID > ORCA_PANE_KEY > tmux fallback"
 }
 
 test_discover_supervisor_target_herdr() {
   local out
-  out=$(FM_SUPERVISOR_TARGET=explicit:target TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 discover_supervisor_target)
+  out=$(FM_SUPERVISOR_TARGET=explicit:target TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 ORCA_PANE_KEY='' discover_supervisor_target)
   [ "$out" = "explicit:target" ] || fail "explicit FM_SUPERVISOR_TARGET override was not honored: $out"
 
-  out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='%3' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 discover_supervisor_target)
+  out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='%3' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 ORCA_PANE_KEY='' discover_supervisor_target)
   [ "$out" = '%3' ] || fail "TMUX_PANE should win over herdr markers: $out"
 
-  out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 HERDR_SESSION='' discover_supervisor_target)
+  out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 HERDR_SESSION='' ORCA_PANE_KEY='' discover_supervisor_target)
   [ "$out" = "default:w1:p9" ] || fail "herdr target should default HERDR_SESSION to 'default': $out"
 
-  out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 HERDR_SESSION=iso1 discover_supervisor_target)
+  out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 HERDR_SESSION=iso1 ORCA_PANE_KEY='' discover_supervisor_target)
   [ "$out" = "iso1:w1:p9" ] || fail "herdr target should use an explicit HERDR_SESSION: $out"
 
-  if out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='' HERDR_ENV='' HERDR_PANE_ID='' discover_supervisor_target); then
+  out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='' HERDR_ENV='' HERDR_PANE_ID='' ORCA_PANE_KEY='tabA:leafB' discover_supervisor_target)
+  [ "$out" = "tabA:leafB" ] || fail "orca target should print \$ORCA_PANE_KEY as-is (resolved to a live handle only at use time): $out"
+
+  out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='%3' HERDR_ENV='' HERDR_PANE_ID='' ORCA_PANE_KEY='tabA:leafB' discover_supervisor_target)
+  [ "$out" = '%3' ] || fail "TMUX_PANE should win over ORCA_PANE_KEY: $out"
+
+  if out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='' HERDR_ENV='' HERDR_PANE_ID='' ORCA_PANE_KEY='' discover_supervisor_target); then
     fail "bare fallback should return non-zero"
   fi
   [ "$out" = "firstmate:0" ] || fail "bare fallback should still print firstmate:0: $out"
 
-  pass "discover_supervisor_target: override > TMUX_PANE > herdr '<session>:<pane-id>' composition > firstmate:0 fallback"
+  pass "discover_supervisor_target: override > TMUX_PANE > herdr '<session>:<pane-id>' composition > ORCA_PANE_KEY > firstmate:0 fallback"
+}
+
+test_supervisor_supported_backends_includes_orca() {
+  fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" orca \
+    || fail "FM_SUPERVISOR_SUPPORTED_BACKENDS should include orca: $FM_SUPERVISOR_SUPPORTED_BACKENDS"
+  fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" zellij \
+    && fail "FM_SUPERVISOR_SUPPORTED_BACKENDS should not (yet) include zellij: $FM_SUPERVISOR_SUPPORTED_BACKENDS"
+  pass "FM_SUPERVISOR_SUPPORTED_BACKENDS includes orca alongside tmux/herdr"
 }
 
 test_pane_is_busy_herdr_native_busy_state() {
@@ -1853,6 +1879,7 @@ test_fm_send_exits_nonzero_on_initial_send_failure
 test_fm_send_exits_nonzero_on_unproven_submit
 test_discover_supervisor_backend_precedence
 test_discover_supervisor_target_herdr
+test_supervisor_supported_backends_includes_orca
 test_pane_is_busy_herdr_native_busy_state
 test_pane_is_busy_herdr_falls_back_to_capture_regex
 test_pane_is_busy_herdr_idle_falls_back_to_capture_regex

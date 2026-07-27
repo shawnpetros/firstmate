@@ -213,18 +213,20 @@ the operational prefix lets firstmate distinguish it from a real captain message
 - **Dedupe across signal/stale/scan** - `classify_signal` and terminal `classify_stale` paths check the seen-status marker before escalating, so a captain-relevant status escalated by one path is not re-escalated by another in the same digest.
   The marker does not clear or suppress possible-wedge aging for a nonterminal progress line.
 - **Auto-discovered supervisor pane** - the daemon resolves its own BACKEND
-  (tmux vs herdr) and TARGET independently, mirroring
+  (tmux vs herdr vs orca) and TARGET independently, mirroring
   `bin/fm-backend.sh`'s own runtime auto-detection. Backend: `FM_SUPERVISOR_BACKEND`
   override, then `$TMUX_PANE` set (tmux), then `$HERDR_ENV=1` with
-  `$HERDR_PANE_ID` present (herdr), then a tmux fallback. Target:
-  `FM_SUPERVISOR_TARGET` override (a tmux target or a herdr
-  `"<session>:<pane-id>"` target), then `$TMUX_PANE`, then
-  `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr, then a
-  `firstmate:0` fallback with a warning. Both resolution sources are logged at
-  startup so a wrong-but-resolving fallback is detectable. Other runtime
-  backends, including zellij, orca, and cmux, are not yet supported as
-  supervisor backends; the daemon refuses loudly at startup instead of
-  misapplying tmux primitives to a pane that isn't one
+  `$HERDR_PANE_ID` present (herdr), then `$ORCA_PANE_KEY` set (orca), then a
+  tmux fallback. Target: `FM_SUPERVISOR_TARGET` override (a tmux target, a
+  herdr `"<session>:<pane-id>"` target, or an Orca pane key), then
+  `$TMUX_PANE`, then `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under
+  herdr, then `$ORCA_PANE_KEY` printed as-is under Orca (resolved to its
+  current live terminal handle on every backend call, since the handle itself
+  rotates within a session), then a `firstmate:0` fallback with a warning.
+  Both resolution sources are logged at startup so a wrong-but-resolving
+  fallback is detectable. Other runtime backends, including zellij and cmux,
+  are not yet supported as supervisor backends; the daemon refuses loudly at
+  startup instead of misapplying tmux primitives to a pane that isn't one
   (docs/herdr-backend.md "Away-mode supervisor support").
 
 ## Stale-artifact lifecycle

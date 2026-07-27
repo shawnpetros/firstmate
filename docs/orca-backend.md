@@ -61,6 +61,15 @@ A missing, unreadable, or mismatched identity preserves metadata and stops rathe
 After those checks, Firstmate closes the exact terminal and releases the exact worktree with Orca's worktree command.
 It never raw-deletes an Orca worktree.
 
+## Away-mode supervisor support
+
+Orca is a supported away-mode supervisor backend alongside tmux and Herdr (`docs/herdr-backend.md` "Away-mode supervisor support").
+Discovery reads the stable `$ORCA_PANE_KEY` (`"<tabId>:<leafId>"`), never the `$ORCA_TERMINAL_HANDLE` env var: that handle is captured once at process start and verified to go stale as Orca rotates it within a session, so `bin/backends/orca.sh` re-resolves the pane key to its current live handle on every call instead of caching one.
+Target existence, busy state (native state is unsupported, so this falls back to the shared tail-regex classifier), composer state, capture, and verified submit all route through the shared `bin/fm-backend.sh` dispatcher into this adapter, exactly as tmux and Herdr do.
+Claude's own composer in Orca renders no box border, so the classifier also recognizes a borderless shape: a horizontal rule, one content row, a second rule, then a harness status-footer line (containing a middle dot) directly beneath.
+A bare shell prompt has neither the border nor the rule/footer shape and reads `unknown`, never a safe empty target.
+This backend has no dedicated non-visible daemon-terminal launcher (`bin/fm-afk-launch.sh` only knows tmux and Herdr for that); it is reached when the primary harness has native tracked background execution and runs the daemon in its own terminal, inheriting the same `$ORCA_PANE_KEY`.
+
 ## Active limits
 
 - Orca is macOS-only and explicit-only.
@@ -76,6 +85,7 @@ It never raw-deletes an Orca worktree.
 tests/fm-backend-orca.test.sh
 tests/fm-backend.test.sh
 tests/fm-bootstrap.test.sh
+tests/fm-daemon.test.sh
 ```
 
 [`verification/runtime-backends.md`](verification/runtime-backends.md#orca) records the real readiness and response-shape smoke.
