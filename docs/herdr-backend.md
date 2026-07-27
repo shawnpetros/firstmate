@@ -255,15 +255,17 @@ There is still one watcher process; the event reader is a bounded child of that 
 
 ## Away-mode supervisor support
 
-The away daemon supports tmux and Herdr supervisor panes only.
-It refuses Zellij, Orca, and cmux as supervisor backends rather than applying the wrong transport.
+The away daemon supports tmux, Herdr, and Orca supervisor panes.
+It refuses Zellij and cmux as supervisor backends rather than applying the wrong transport.
 For Herdr, target existence, native state, capture, composer state, and verified submit all route through the shared backend dispatcher and the explicit named-session CLI owner.
+For Orca, the same dispatcher routes through `bin/backends/orca.sh` (see [`orca-backend.md`](orca-backend.md#away-mode-supervisor-support)); the daemon target stays the stable `$ORCA_PANE_KEY`, resolved to its current live terminal handle on every call rather than cached, since the handle itself rotates within a session.
 The pane-independent max-defer alert is configured in [`wedge-alarm.md`](wedge-alarm.md).
 
 Harnesses with native tracked background execution can run the daemon in their terminal.
 Pi has no such mechanism.
 `bin/fm-afk-launch.sh` therefore creates a dedicated unfocused Herdr workspace, runs the daemon there with an explicit supervisor target and backend, records the exact daemon pane, and closes only that pane on stop.
 It never splits the captain's active tab and never uses shell `&`.
+Only tmux and Herdr can host that dedicated daemon terminal today; Orca is supported only as a supervisor-pane injection target, reached when the primary harness itself has native background execution (so `fm-afk-launch.sh` never needs to create a terminal for it).
 Recovery reconciles only the recorded exact id.
 
 On stop, the daemon receives termination while `state/.afk` still exists so its final flush can run, the recorded terminal is closed, and the AFK flag is removed last.
@@ -292,7 +294,7 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
 - Mid-session secondmate liveness is not implemented.
 - OpenCode 1.18.4 can accept Enter while busy without clearing the composer.
   The tmux backend has a busy-queue fallback, but Herdr still reports this case as submit pending and needs a separate adapter fix.
-- Only tmux and Herdr can host the away-mode supervisor terminal.
+- Only tmux and Herdr can host a dedicated non-visible away-mode daemon terminal (see "Away-mode supervisor support" above for Orca's native-background-only path).
 
 ## Regression entry points
 

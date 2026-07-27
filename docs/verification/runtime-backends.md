@@ -443,6 +443,51 @@ tests/fm-bootstrap.test.sh
 
 The fake-Orca suite covers readiness, registration, create response parsing, metadata routing, popup-safe submit, and path-matched release refusal.
 
+### Away-mode supervisor support
+
+Verified 2026-07-27 against `/opt/homebrew/bin/orca` with `ORCA_APP_VERSION=1.4.152` (Orca.app).
+
+**Terminal handle staleness (the reason live resolution can't cache).** A process running inside an Orca-managed terminal carries `ORCA_TERMINAL_HANDLE` (captured once at process start) and `ORCA_PANE_KEY`/`ORCA_TAB_ID` (`"<tabId>:<leafId>"`, stable for the terminal's lifetime).
+Across this same verification session the live handle for one fixed pane key rotated at least twice (`term_6045cda1-...` -> `term_8d470523-...` -> a later value), confirming a cached handle goes stale within a session and every use must re-resolve.
+
+**Pane-key resolution.** `orca terminal list --json`'s flat `result.terminals[]` array reports the correct, matching `tabId`/`leafId` for a terminal that is part of the visible tab layout (`result.visualLayouts`) - which is what every real interactive Orca session (the away-mode supervisor's actual target) is.
+For a terminal created via `orca terminal create` with no `--focus` (never adopted into a visible tab), that array instead reports a synthetic ptyId-derived placeholder for `tabId`/`leafId` that does not match the terminal's own `$ORCA_PANE_KEY`; `--focus` forces real tab adoption and the placeholder disappears.
+`fm_backend_orca_resolve_terminal` matches `tabId`+`leafId` from `result.terminals[]`, which is correct for the away-mode supervisor's actual target (always a real interactive tab) and does not need `result.visualLayouts`.
+
+Command and live result, resolving a real interactive tab's stable pane key to its current handle:
+
+```sh
+orca terminal list --json
+```
+
+```text
+tabId=0d82ae7d-ef49-400c-afe1-e42960168689 leafId=0b0fc55e-6e18-4bd1-8367-9d98ea7eced8
+-> handle=term_eb147780-3fb2-4816-a2a8-6d41185fc62c
+```
+
+**Composer classification, end to end in a scratch terminal** (created with `orca terminal create --focus` in the current worktree so it is a real tab, `claude` launched inside it, closed after):
+
+| Composer state | Captured tail (abbreviated) | `fm_backend_orca_composer_state` verdict |
+| --- | --- | --- |
+| Idle | `──…──` / `❯` / `──…──` / `→ ... · ctx ...` / `⏵⏵ auto mode on ...` | `empty` |
+| Unsubmitted text | same shape with `❯ this is unsubmitted test text` | `pending` |
+| Bare shell prompt (before `claude` was launched) | `➜ fm-orca-supervisor-m4 git:(...)`, no rule/footer shape | `unknown` |
+
+**Live injected submit**, through the same dispatcher path `inject_msg` uses (`fm_backend_send_text_submit orca <pane-key> "<text>" ...`):
+
+```text
+submit verdict: empty
+```
+
+The terminal's tail afterward showed the literal text handed to Claude and a turn beginning (`✽ Simmering… (2s · thinking with xhigh effort)`), confirming the message was both typed and submitted, not merely queued.
+
+```sh
+tests/fm-daemon.test.sh
+tests/fm-backend-orca.test.sh
+```
+
+`tests/fm-daemon.test.sh` covers `discover_supervisor_target`/`discover_supervisor_backend`'s Orca precedence and that `FM_SUPERVISOR_SUPPORTED_BACKENDS` includes `orca`; `tests/fm-backend-orca.test.sh` covers `fm_backend_orca_resolve_terminal` (passthrough, pane-key resolution, not-found) and the rule-delimited composer recognizer (empty, pending, no-footer-stays-unknown), alongside the existing bordered-composer and bare-shell-prompt cases.
+
 ## cmux
 
 The current compatibility floor is cmux 0.64, and the active live evidence uses 0.64.17 build 97 on macOS aarch64.

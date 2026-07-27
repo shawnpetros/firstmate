@@ -4,7 +4,12 @@
 # Orca owns both the task worktree and the terminal endpoint. Escape key support
 # remains unsupported until Orca exposes a terminal-send primitive for it.
 #
-# Target string shape: the Orca terminal id accepted by `orca terminal ...`.
+# Target string shape: the Orca terminal id accepted by `orca terminal ...`,
+# OR a stable Orca pane key ("<tabId>:<leafId>", the shape $ORCA_PANE_KEY
+# takes). fm_backend_orca_resolve_terminal resolves the latter to its current
+# live handle on every call - the only shape the away-mode supervisor path
+# ever passes, since its target is cached for the daemon's whole run and a
+# terminal handle demonstrably rotates within a session.
 
 # Shared composer-content classifier (empty|pending|unknown, and the fleet-wide
 # dead-shell-vs-agent-composer rule). Owned by bin/fm-composer-lib.sh, reused by
@@ -46,6 +51,57 @@ if (reachable === true && state === "ready") process.exit(0);
 console.error(`error: backend=orca requires a ready Orca runtime (reachable=${String(reachable)}, state=${state || "unknown"})`);
 process.exit(1);
 '
+}
+
+# fm_backend_orca_resolve_terminal: <target> -> a live Orca terminal handle.
+# A crewmate-task target is already a resolved handle (e.g. "term_...",
+# returned once by `orca terminal create`/`orca worktree create` and used
+# right away), so anything without exactly one ':' separating two non-empty
+# halves passes straight through unchanged.
+# The away-mode supervisor path is different: discover_supervisor_target
+# (bin/fm-supervisor-target-lib.sh) can only pass the STABLE Orca pane key
+# $ORCA_PANE_KEY ("<tabId>:<leafId>"), never $ORCA_TERMINAL_HANDLE - that env
+# var is captured once at session start and verified to go stale (Orca
+# rotates the underlying terminal handle within a session; see
+# docs/verification/runtime-backends.md "Orca"). So a pane-key-shaped target
+# is resolved to its CURRENT live handle by matching both ids against
+# `orca terminal list --json`, fresh on every call (deliberately not cached)
+# so a long-lived daemon poll never dispatches against a rotated-away handle.
+fm_backend_orca_resolve_terminal() {  # <target> -> live terminal handle
+  local target=$1 tab_id leaf_id out
+  tab_id=${target%%:*}
+  leaf_id=${target#*:}
+  if [ -z "$tab_id" ] || [ -z "$leaf_id" ] || [ "$leaf_id" = "$target" ]; then
+    printf '%s' "$target"
+    return 0
+  fi
+  fm_backend_orca_tool_check || return 1
+  out=$(orca terminal list --json) || return 1
+  printf '%s' "$out" | node -e '
+const fs = require("fs");
+const [tabId, leafId] = process.argv.slice(1);
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(0, "utf8"));
+} catch (err) {
+  console.error("error: invalid Orca terminal list JSON: " + err.message);
+  process.exit(1);
+}
+if (data.ok === false) {
+  const msg = data.error && (data.error.message || data.error.code);
+  console.error("error: orca terminal list failed" + (msg ? ": " + msg : ""));
+  process.exit(1);
+}
+const terms = (data.result && Array.isArray(data.result.terminals)) ? data.result.terminals : [];
+for (const t of terms) {
+  if (t && t.tabId === tabId && t.leafId === leafId && t.handle) {
+    process.stdout.write(String(t.handle));
+    process.exit(0);
+  }
+}
+console.error("error: no live Orca terminal found for pane key " + tabId + ":" + leafId);
+process.exit(1);
+' "$tab_id" "$leaf_id"
 }
 
 fm_backend_orca_json_get() {  # <field> ; fields: worktree-id worktree-path terminal-handle worktree-terminal-handle repo-id
@@ -168,12 +224,14 @@ fm_backend_orca_terminal_create() {  # <worktree-id> <title>
 fm_backend_orca_send_text_line() {  # <terminal-id> <text>
   local terminal=$1 text=$2
   fm_backend_orca_tool_check || return 1
+  terminal=$(fm_backend_orca_resolve_terminal "$terminal") || return 1
   fm_backend_orca_run_json orca terminal send --terminal "$terminal" --text "$text" --enter --json
 }
 
 fm_backend_orca_send_literal() {  # <terminal-id> <text>
   local terminal=$1 text=$2
   fm_backend_orca_tool_check || return 1
+  terminal=$(fm_backend_orca_resolve_terminal "$terminal") || return 1
   fm_backend_orca_run_json orca terminal send --terminal "$terminal" --text "$text" --json
 }
 
@@ -199,6 +257,7 @@ fm_backend_orca_worktree_path() {
 fm_backend_orca_capture() {  # <terminal-id> <lines>
   local terminal=$1 lines=${2:-40} out
   fm_backend_orca_tool_check || return 1
+  terminal=$(fm_backend_orca_resolve_terminal "$terminal") || return 1
   out=$(orca terminal read --terminal "$terminal" --limit "$lines" --json) || return 1
   fm_backend_orca_json_text "$out"
 }
@@ -248,6 +307,7 @@ process.stdout.write(v);
 fm_backend_orca_read_text_paged() {  # <terminal-id> <limit>
   local terminal=$1 limit=${2:-200} out limited oldest cursor_out text older_text
   fm_backend_orca_tool_check || return 1
+  terminal=$(fm_backend_orca_resolve_terminal "$terminal") || return 1
   out=$(orca terminal read --terminal "$terminal" --limit "$limit" --json) || return 1
   printf '%s' "$out" | fm_backend_orca_json_ok || return 1
   text=$(fm_backend_orca_json_text "$out") || return 1
@@ -264,14 +324,20 @@ fm_backend_orca_read_text_paged() {  # <terminal-id> <limit>
 
 FM_BACKEND_ORCA_COMPOSER_LINES=${FM_BACKEND_ORCA_COMPOSER_LINES:-200}
 FM_BACKEND_ORCA_IDLE_RE=${FM_BACKEND_ORCA_IDLE_RE:-'^Type a message\.\.\.$'}
+# A footer line under Claude's rule-delimited composer (see
+# fm_backend_orca_rule_delimited_composer_row) separates its fields with a
+# middle dot, e.g. "firstmate(main) · Opus 5 (1M context) · xhigh · ctx 57%"
+# or "auto mode on (shift+tab to cycle) · ← for agents". A bare shell has no
+# such line, which is what keeps the rule-delimited shape from matching one.
+FM_BACKEND_ORCA_FOOTER_MARK=${FM_BACKEND_ORCA_FOOTER_MARK:-'·'}
+FM_BACKEND_ORCA_FOOTER_WINDOW=${FM_BACKEND_ORCA_FOOTER_WINDOW:-4}
+FM_BACKEND_ORCA_RULE_RE=${FM_BACKEND_ORCA_RULE_RE:-'^─{5,}$'}
 
-# fm_backend_orca_composer_state: classify the composer's own bordered row as
-# empty|pending|unknown. Real text stays pending, including a slash-command
-# popup that closed by filling an argument-hint placeholder into the composer;
-# that first Enter selected the popup item, it did not submit the command.
-fm_backend_orca_composer_state() {  # <terminal-id> -> empty|pending|unknown
-  local terminal=$1 cap line trimmed stripped="" found=0
-  cap=$(fm_backend_orca_read_text_paged "$terminal" "$FM_BACKEND_ORCA_COMPOSER_LINES") || { printf 'unknown'; return 0; }
+# fm_backend_orca_bordered_composer_row: <capture> -> the border-stripped,
+# trimmed content of the LAST bordered (│...│ / ┃...┃ / |...|) row found, or
+# return 1 when no such row exists.
+fm_backend_orca_bordered_composer_row() {  # <capture>
+  local cap=$1 line trimmed stripped="" found=0
   while IFS= read -r line; do
     trimmed="${line#"${line%%[![:space:]]*}"}"
     trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
@@ -283,21 +349,80 @@ fm_backend_orca_composer_state() {  # <terminal-id> -> empty|pending|unknown
     stripped=$trimmed
     found=1
   done < <(printf '%s\n' "$cap")
-  [ "$found" -eq 1 ] || { printf 'unknown'; return 0; }
+  [ "$found" -eq 1 ] || return 1
   stripped=${stripped//│/}
   stripped=${stripped//┃/}
   stripped=${stripped//|/}
   stripped="${stripped#"${stripped%%[![:space:]]*}"}"
   stripped="${stripped%"${stripped##*[![:space:]]}"}"
-  # A row was found only by the bordered shape above, so content came from a
-  # genuine composer box - delegate to the shared owner with bordered=1. A bare
-  # dead-shell prompt has no bordered row and already returned 'unknown' above.
-  fm_composer_classify_content 1 "$stripped" "$FM_BACKEND_ORCA_IDLE_RE"
+  printf '%s' "$stripped"
+}
+
+# fm_backend_orca_rule_delimited_composer_row: <capture> -> the trimmed
+# content of the LAST borderless composer row, recognized structurally
+# instead of by box-drawing border characters: a horizontal rule line, one
+# content row (Claude renders the bare '❯' prompt glyph here even when idle),
+# a second rule line, then - directly beneath, within
+# FM_BACKEND_ORCA_FOOTER_WINDOW lines - a harness status-footer line
+# containing FM_BACKEND_ORCA_FOOTER_MARK. A dead shell prompt has none of
+# this shape (no rules, no footer), so it never matches and this returns 1,
+# leaving the caller to report 'unknown' rather than misreading a bare glyph
+# as a safe empty composer.
+fm_backend_orca_rule_delimited_composer_row() {  # <capture>
+  local cap=$1 line
+  local -a lines=()
+  while IFS= read -r line; do lines+=("$line"); done < <(printf '%s\n' "$cap")
+  local n=${#lines[@]} i j content trimmed footer_line has_footer
+  for ((i = n - 1; i >= 0; i--)); do
+    [[ ${lines[i]} =~ $FM_BACKEND_ORCA_RULE_RE ]] || continue
+    [ $((i + 2)) -lt "$n" ] || continue
+    [[ ${lines[i + 2]} =~ $FM_BACKEND_ORCA_RULE_RE ]] || continue
+    content=${lines[i + 1]}
+    trimmed="${content#"${content%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [ -n "$trimmed" ] || continue
+    has_footer=0
+    for ((j = i + 3; j < n && j < i + 3 + FM_BACKEND_ORCA_FOOTER_WINDOW; j++)); do
+      footer_line=${lines[j]}
+      case "$footer_line" in
+        *"$FM_BACKEND_ORCA_FOOTER_MARK"*) has_footer=1; break ;;
+      esac
+    done
+    [ "$has_footer" -eq 1 ] || continue
+    printf '%s' "$trimmed"
+    return 0
+  done
+  return 1
+}
+
+# fm_backend_orca_composer_state: classify the composer content as
+# empty|pending|unknown. Real text stays pending, including a slash-command
+# popup that closed by filling an argument-hint placeholder into the composer;
+# that first Enter selected the popup item, it did not submit the command.
+# Tries the bordered composer shape first (older/other harnesses), then the
+# rule-delimited shape Claude renders in Orca with no box border; either way,
+# a matched row is a genuine agent composer (bordered=1), so a bare glyph in
+# it reads empty per bin/fm-composer-lib.sh's shared rule. A pane with
+# neither shape - a bare dead shell prompt, or an unreadable pane - reports
+# unknown, never empty.
+fm_backend_orca_composer_state() {  # <terminal-id> -> empty|pending|unknown
+  local terminal=$1 cap content
+  cap=$(fm_backend_orca_read_text_paged "$terminal" "$FM_BACKEND_ORCA_COMPOSER_LINES") || { printf 'unknown'; return 0; }
+  if content=$(fm_backend_orca_bordered_composer_row "$cap"); then
+    fm_composer_classify_content 1 "$content" "$FM_BACKEND_ORCA_IDLE_RE"
+    return 0
+  fi
+  if content=$(fm_backend_orca_rule_delimited_composer_row "$cap"); then
+    fm_composer_classify_content 1 "$content" "$FM_BACKEND_ORCA_IDLE_RE"
+    return 0
+  fi
+  printf 'unknown'
 }
 
 fm_backend_orca_send_key() {  # <terminal-id> <key>
   local terminal=$1 key=$2
   fm_backend_orca_tool_check || return 1
+  terminal=$(fm_backend_orca_resolve_terminal "$terminal") || return 1
   case "$key" in
     C-c|ctrl+c|Ctrl-c|Ctrl-C)
       fm_backend_orca_run_json orca terminal send --terminal "$terminal" --interrupt --json
@@ -331,6 +456,8 @@ fm_backend_orca_send_text_submit() {  # <terminal-id> <text> <retries> <enter-sl
 }
 
 fm_backend_orca_kill() {  # <terminal-id>
+  local terminal
   fm_backend_orca_tool_check || return 0
-  orca terminal close --terminal "$1" --json >/dev/null 2>&1 || true
+  terminal=$(fm_backend_orca_resolve_terminal "$1") || return 0
+  orca terminal close --terminal "$terminal" --json >/dev/null 2>&1 || true
 }

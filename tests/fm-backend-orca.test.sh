@@ -109,6 +109,62 @@ test_capture_fails_on_orca_error_json() {
   pass "fm_backend_orca_capture: fails closed on Orca read error JSON"
 }
 
+# fm_backend_orca_resolve_terminal (task fm-orca-supervisor-m4): a crewmate-
+# task target is already a resolved handle and must pass through with no
+# `orca` call at all. The away-mode supervisor's target is instead the stable
+# "<tabId>:<leafId>" pane key ($ORCA_PANE_KEY), which must be resolved to its
+# CURRENT live handle via `orca terminal list --json` on every call, since
+# $ORCA_TERMINAL_HANDLE is captured once at session start and verified to go
+# stale as Orca rotates the underlying handle within a session.
+test_resolve_terminal_passes_through_already_resolved_handle() {
+  local out
+  orca_case resolve-passthrough
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_resolve_terminal term_eb147780-3fb2-4816-a2a8-6d41185fc62c' "$ROOT" )
+  [ "$out" = "term_eb147780-3fb2-4816-a2a8-6d41185fc62c" ] || fail "an already-resolved handle should pass through unchanged, got '$out'"
+  [ ! -s "$LOG" ] || fail "resolving an already-resolved handle should not call orca at all, but log has: $(cat "$LOG")"
+  pass "fm_backend_orca_resolve_terminal: passes an already-resolved terminal handle through unchanged"
+}
+
+test_resolve_terminal_resolves_pane_key_via_terminal_list() {
+  local out
+  orca_case resolve-pane-key
+  printf '{"ok":true,"result":{"terminals":[{"handle":"term_other","tabId":"tabX","leafId":"leafY"},{"handle":"term_live","tabId":"tabA","leafId":"leafB"}]}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_resolve_terminal tabA:leafB' "$ROOT" )
+  [ "$out" = term_live ] || fail "resolve_terminal should match tabId+leafId and return that terminal's handle, got '$out'"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''list'$'\x1f''--json' \
+    "resolve_terminal did not call orca terminal list --json"
+  pass "fm_backend_orca_resolve_terminal: resolves a <tabId>:<leafId> pane key to its live terminal handle"
+}
+
+test_resolve_terminal_fails_when_pane_key_not_found() {
+  local out status
+  orca_case resolve-pane-key-missing
+  printf '{"ok":true,"result":{"terminals":[{"handle":"term_other","tabId":"tabX","leafId":"leafY"}]}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_resolve_terminal tabA:leafB' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "resolve_terminal should fail closed when no live terminal matches the pane key"
+  assert_contains "$out" "no live Orca terminal found" "resolve_terminal should explain the unmatched pane key"
+  pass "fm_backend_orca_resolve_terminal: fails closed when the pane key matches no live terminal"
+}
+
+test_capture_resolves_pane_key_before_reading() {
+  local out
+  orca_case capture-resolves-pane-key
+  printf '{"ok":true,"result":{"terminals":[{"handle":"term_live","tabId":"tabA","leafId":"leafB"}]}}\n' > "$RESP/1.out"
+  printf '{"result":{"terminal":{"tail":["captain pane content"]}}}\n' > "$RESP/2.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_capture tabA:leafB 40' "$ROOT" )
+  [ "$out" = "captain pane content" ] || fail "capture should read the resolved live handle's content, got '$out'"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''list'$'\x1f''--json' \
+    "capture with a pane-key target did not resolve via orca terminal list first"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''read'$'\x1f''--terminal'$'\x1f''term_live'$'\x1f''--limit'$'\x1f''40'$'\x1f''--json' \
+    "capture did not read the RESOLVED live handle (term_live), not the raw pane key"
+  pass "fm_backend_orca_capture: resolves a pane-key target to its live handle before reading"
+}
+
 test_runtime_check_accepts_ready_orca_status() {
   local out
   orca_case runtime-ready
@@ -209,6 +265,42 @@ test_composer_state_bare_shell_prompt_is_unknown() {
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_composer_state term-123' "$ROOT" )
   [ "$out" = unknown ] || fail "a bare dead-shell prompt (no bordered composer row) must read unknown, got '$out'"
   pass "fm_backend_orca_composer_state: a bare dead-shell prompt reads unknown (unsafe-for-injection), never empty"
+}
+
+# Claude-in-Orca renders no box border around its composer: a horizontal rule,
+# one content row (the bare '❯' glyph when idle), a second rule, then a status
+# footer line beneath (task fm-orca-supervisor-m4). These three tests pin the
+# rule-delimited recognizer added for that shape, plus its two ways of NOT
+# matching (no footer marker; a bare shell prompt with none of this structure),
+# which is what keeps a dead shell from ever being misread as a safe target.
+test_composer_state_rule_delimited_empty_is_empty() {
+  local out
+  orca_case composer-rule-delimited-empty
+  printf '{"ok":true,"result":{"terminal":{"tail":["──────────────────────────────────────────────────────────","❯","──────────────────────────────────────────────────────────","  → firstmate(main) · Opus 5 (1M context) · xhigh · ctx 57%% ·","  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"]}}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_composer_state term-123' "$ROOT" )
+  [ "$out" = empty ] || fail "a rule-delimited idle composer (bare ❯ glyph) should read empty, got '$out'"
+  pass "fm_backend_orca_composer_state: a rule-delimited idle Claude composer with no box border reads empty"
+}
+
+test_composer_state_rule_delimited_pending_is_pending() {
+  local out
+  orca_case composer-rule-delimited-pending
+  printf '{"ok":true,"result":{"terminal":{"tail":["──────────────────────────────────────────────────────────","❯ hello captain","──────────────────────────────────────────────────────────","  → firstmate(main) · Opus 5 (1M context) · xhigh · ctx 57%% ·","  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"]}}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_composer_state term-123' "$ROOT" )
+  [ "$out" = pending ] || fail "a rule-delimited composer holding real typed text should read pending, got '$out'"
+  pass "fm_backend_orca_composer_state: a rule-delimited Claude composer with unsubmitted text reads pending"
+}
+
+test_composer_state_rule_lines_without_footer_stay_unknown() {
+  local out
+  orca_case composer-rule-lines-no-footer
+  printf '{"ok":true,"result":{"terminal":{"tail":["──────────────────────────────────────────────────────────","❯","──────────────────────────────────────────────────────────","just some plain output with no middle dot at all"]}}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_composer_state term-123' "$ROOT" )
+  [ "$out" = unknown ] || fail "two rule lines with no harness status footer beneath must stay unknown (not a proven agent composer), got '$out'"
+  pass "fm_backend_orca_composer_state: rule lines without a harness status footer never count as a safe empty composer"
 }
 
 test_send_text_submit_popup_autocomplete_requires_second_enter() {
@@ -1279,6 +1371,10 @@ test_dispatcher_sources_orca_and_routes_primitives() {
 test_capture_reads_terminal_tail_json
 test_capture_falls_back_to_text_fields
 test_capture_fails_on_orca_error_json
+test_resolve_terminal_passes_through_already_resolved_handle
+test_resolve_terminal_resolves_pane_key_via_terminal_list
+test_resolve_terminal_fails_when_pane_key_not_found
+test_capture_resolves_pane_key_before_reading
 test_runtime_check_accepts_ready_orca_status
 test_runtime_check_refuses_unready_orca_status
 test_send_text_submit_verifies_empty_composer_after_enter
@@ -1286,6 +1382,9 @@ test_send_text_submit_keeps_current_tail_when_limited
 test_send_text_submit_retries_when_composer_stays_pending
 test_composer_state_popup_placeholder_fill_is_pending
 test_composer_state_bare_shell_prompt_is_unknown
+test_composer_state_rule_delimited_empty_is_empty
+test_composer_state_rule_delimited_pending_is_pending
+test_composer_state_rule_lines_without_footer_stay_unknown
 test_send_text_submit_popup_autocomplete_requires_second_enter
 test_send_literal_constructs_non_enter_send
 test_send_text_submit_reports_send_failed
