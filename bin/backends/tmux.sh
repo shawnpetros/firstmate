@@ -148,6 +148,15 @@ fm_backend_tmux_current_command() {  # <target>
   tmux display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null
 }
 
+fm_backend_tmux_current_args() {  # <target>
+  local pid tpgid
+  pid=$(tmux display-message -p -t "$1" '#{pane_pid}' 2>/dev/null) || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  tpgid=$(ps -o tpgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
+  case "$tpgid" in ''|*[!0-9]*) return 1 ;; esac
+  ps -o args= -p "$tpgid" 2>/dev/null
+}
+
 # fm_backend_tmux_agent_state: recovery-grade harness-agent state for one
 # recorded target. See bin/fm-backend.sh's fm_backend_agent_state for the
 # shared state vocabulary and docs/tmux-backend.md "Agent liveness probe" for
@@ -203,9 +212,21 @@ fm_backend_tmux_agent_state() {  # <target>
 # Backward-compatible three-state view for callers that only need a yes/no
 # agent verdict. The detailed state contract is owned by fm_backend_agent_state.
 fm_backend_tmux_agent_alive() {  # <target>
-  case "$(fm_backend_tmux_agent_state "$1")" in
-    alive) printf 'alive' ;;
-    dead|missing) printf 'dead' ;;
+  local target=$1 comm args first
+  comm=$(fm_backend_tmux_current_command "$target") || { printf 'unknown'; return 0; }
+  comm=${comm#-}
+  case "$comm" in
+    '') printf 'unknown' ;;
+    *claude*|*codex*|*opencode*|*grok*) printf 'alive' ;;
+    node)
+      args=$(fm_backend_tmux_current_args "$target") || { printf 'unknown'; return 0; }
+      first=${args%%[[:space:]]*}
+      case "${first##*/}" in
+        cursor-agent) printf 'alive' ;;
+        *) printf 'unknown' ;;
+      esac
+      ;;
+    zsh|bash|sh|dash|ash|ksh|mksh|tcsh|csh|fish) printf 'dead' ;;
     *) printf 'unknown' ;;
   esac
 }

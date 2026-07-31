@@ -9,64 +9,101 @@
 # This file is sourced by scripts and has no side effects on source.
 
 # Known harness command names; extend when a new adapter is verified.
-FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$'
+# Spell cursor-agent in full so an unrelated process mentioning "cursor" cannot
+# match. Cursor IDE primaries use CURSOR_AGENT=1 + CURSOR_CONVERSATION_ID via
+# fm_harness_lock_identity instead of a shared Cursor Helper PID.
+FM_HARNESS_RE='claude|codex|opencode|grok|kimi|cursor-agent|^pi$|^pi-signed$'
 
-# Walk the current process ancestry (up to 16 hops) and print a harness pid.
-# For every harness except Claude, the first match wins (innermost pid), which
-# is where e.g. Pi's shared signed-wrapper ancestry actually holds the session:
-# a "pi-signed" launcher can be the direct parent of the inner "pi" engine
-# pid that owns the lock, and the wrapper pid above it is not that owner.
-# Claude Code's bg-spare hook worker chain is the opposite shape: it nests
-# several claude-named processes directly parent-child with no non-harness
-# process between them, and the lock is held by the outermost pid of that
-# run. So once a claude-named match is found, this keeps walking past it
-# looking for a still-more-ancestral claude-named match, and stops the
-# instant a non-match follows - never walking past that gap to an unrelated
-# claude-named process further up the real process tree (e.g. the live
-# session that launched a test as its own subprocess). The harness pid lives
-# as long as the session, unlike the transient subshell pid of any one tool
-# call.
+# Grace period for Cursor IDE conversation-scoped lock beats (seconds).
+FM_CURSOR_LOCK_BEAT_GRACE_SECS="${FM_CURSOR_LOCK_BEAT_GRACE_SECS:-900}"
+
+# Print cursor-conv:<id> when this process is a Cursor IDE agent tool child with
+# a usable conversation id. Fail closed when CURSOR_AGENT=1 but the id is absent
+# or contains characters outside the verified safe set.
+fm_cursor_conv_token() {
+  [ "${CURSOR_AGENT:-}" = "1" ] || return 1
+  local id=${CURSOR_CONVERSATION_ID:-}
+  [ -n "$id" ] || return 1
+  case "$id" in
+    *[!A-Za-z0-9_-]*) return 1 ;;
+  esac
+  printf 'cursor-conv:%s\n' "$id"
+}
+
+# Refresh the conversation beat used for cross-session liveness of cursor-conv
+# lock tokens. $1 = state dir, $2 = conversation id (no prefix).
+fm_cursor_lock_touch_beat() {
+  local state=$1 id=$2
+  [ -n "$state" ] && [ -n "$id" ] || return 1
+  mkdir -p "$state" 2>/dev/null || return 1
+  printf '%s\n' "$id" > "$state/.lock-cursor-beat"
+}
+
+# True when a cursor-conv lock token still looks live.
+# Alive if: current env owns that conversation, or a matching beat file is fresh.
+fm_cursor_conv_alive() {  # <token> <state-dir-or-empty>
+  local token=$1 state=${2:-} id beat_id age now mtime
+  case "$token" in
+    cursor-conv:*) id=${token#cursor-conv:} ;;
+    *) return 1 ;;
+  esac
+  [ -n "$id" ] || return 1
+  if [ "${CURSOR_AGENT:-}" = "1" ] && [ "${CURSOR_CONVERSATION_ID:-}" = "$id" ]; then
+    return 0
+  fi
+  [ -n "$state" ] || return 1
+  [ -f "$state/.lock-cursor-beat" ] || return 1
+  beat_id=$(tr -d '[:space:]' < "$state/.lock-cursor-beat" 2>/dev/null || true)
+  [ "$beat_id" = "$id" ] || return 1
+  now=$(date +%s)
+  mtime=$(stat -f %m "$state/.lock-cursor-beat" 2>/dev/null || stat -c %Y "$state/.lock-cursor-beat" 2>/dev/null) || return 1
+  age=$((now - mtime))
+  [ "$age" -ge 0 ] && [ "$age" -le "$FM_CURSOR_LOCK_BEAT_GRACE_SECS" ]
+}
+
+# Walk the current process ancestry (up to 8 hops) and print the first pid whose
+# command looks like a verified harness. The harness pid lives as long as the
+# session, unlike the transient subshell pid of any one tool call.
 fm_harness_ancestry_pid() {
-  local pid=$$ comm args best='' bc extending=0 hit=0 is_claude=0
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
+  local pid=$$ comm args
+  for _ in 1 2 3 4 5 6 7 8; do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
     args=$(ps -o args= -p "$pid" 2>/dev/null)
-    bc=$(basename -- "$comm")
-    hit=0; is_claude=0
-    if printf '%s' "$bc" | grep -qE "$FM_HARNESS_RE"; then
-      hit=1
-      case "$bc" in *claude*) is_claude=1 ;; esac
-    else
-      # Bare interpreter (e.g. node): match the harness name in its script path.
-      case "$comm" in
-        *node*|*python*)
-          if printf '%s' "$args" | grep -qE "$FM_HARNESS_RE"; then
-            hit=1
-            case "$args" in *claude*) is_claude=1 ;; esac
-          fi
-          ;;
-      esac
+    if printf '%s' "$(basename -- "$comm")" | grep -qE "$FM_HARNESS_RE"; then
+      echo "$pid"; return 0
     fi
-    if [ "$hit" -eq 1 ]; then
-      best="$pid"
-      if [ "$is_claude" -eq 1 ]; then
-        extending=1
-      else
-        break
-      fi
-    elif [ "$extending" -eq 1 ]; then
-      break
-    fi
+    # Bare interpreter (e.g. node): match the harness name in its script path.
+    case "$comm" in
+      *node*|*python*) printf '%s' "$args" | grep -qE "$FM_HARNESS_RE" && { echo "$pid"; return 0; } ;;
+    esac
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    [ -n "$pid" ] && [ "$pid" -gt 1 ] || break
+    [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 1
   done
-  [ -n "$best" ] && { echo "$best"; return 0; }
   return 1
+}
+
+# Lock identity for this session: conversation-scoped Cursor IDE token when
+# applicable, otherwise the harness ancestor PID. Cursor IDE with CURSOR_AGENT=1
+# but no usable CURSOR_CONVERSATION_ID fails closed (shared Helper PIDs must not
+# own the fleet lock).
+fm_harness_lock_identity() {
+  local tok
+  if tok=$(fm_cursor_conv_token); then
+    printf '%s\n' "$tok"
+    return 0
+  fi
+  if [ "${CURSOR_AGENT:-}" = "1" ]; then
+    return 1
+  fi
+  fm_harness_ancestry_pid
 }
 
 # True if $1 is a live process that looks like a verified harness.
 fm_harness_pid_alive() {
   local pid=$1 comm args
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
   kill -0 "$pid" 2>/dev/null || return 1
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
   if printf '%s' "$(basename -- "$comm")" | grep -qE "$FM_HARNESS_RE"; then
@@ -81,16 +118,23 @@ fm_harness_pid_alive() {
   esac
 }
 
-# True when state dir $1 holds a session lock whose pid is the harness ancestor
-# of the current process: this script runs inside the session that owns the
-# home's fleet lock. A missing lock, a lock held by another live harness, or an
-# ancestry that cannot be resolved all fail closed.
-fm_session_lock_owned_by_self() {
-  local state=$1 lock_pid my_pid
-  lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
-  case "$lock_pid" in
-    ''|*[!0-9]*) return 1 ;;
+# True if lock token $1 is still held by a live session.
+# Optional $2 is the state dir (required to evaluate cursor-conv beat liveness).
+fm_harness_lock_alive() {
+  local token=$1 state=${2:-}
+  case "$token" in
+    cursor-conv:*) fm_cursor_conv_alive "$token" "$state" ;;
+    *) fm_harness_pid_alive "$token" ;;
   esac
-  my_pid=$(fm_harness_ancestry_pid) || return 1
-  [ "$my_pid" = "$lock_pid" ]
+}
+
+# True when state dir $1 holds a session lock whose identity matches this
+# process's lock identity. A missing lock, a lock held by another live harness,
+# or an identity that cannot be resolved all fail closed.
+fm_session_lock_owned_by_self() {
+  local state=$1 lock_id my_id
+  lock_id=$(tr -d '[:space:]' < "$state/.lock" 2>/dev/null || true)
+  [ -n "$lock_id" ] || return 1
+  my_id=$(fm_harness_lock_identity) || return 1
+  [ "$my_id" = "$lock_id" ]
 }
